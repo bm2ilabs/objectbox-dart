@@ -703,48 +703,47 @@ class Builder {
   }
 
   int _writeString(String value) {
-    // [utf8.encode()] is slow (up to at least Dart SDK 2.13). If the given
-    // string is ASCII we can just write it directly, without any conversion.
-    final originalTail = _tail;
-    if (!_tryWriteASCIIString(value)) {
-      // reset the output buffer position for [_writeUTFString()]
-      _tail = originalTail;
-      _writeUTFString(value);
-    }
-    return _tail;
-  }
+    // [utf8.encode()] is slow as of Dart SDK 2.13, if the given string is ascii
+    // we can just write it directly, without any encoding. Therefore we first
+    // try to write the string as ASCII directly and only fall back to
+    // [utf8.encode()] when we encounter a non-ascii character.
 
-  // Try to write the string as ASCII, return false if there's a non-ascii char.
-  @pragma('vm:prefer-inline')
-  bool _tryWriteASCIIString(String value) {
-    _prepare(4, 1, additionalBytes: value.length + 1);
-    final length = value.length;
-    var offset = _buf.lengthInBytes - _tail + 4;
-    for (var i = 0; i < length; i++) {
-      // utf16 code unit, e.g. for '†' it's [0x20 0x20], which is 8224 decimal.
-      // ASCII characters go from 0x00 to 0x7F (which is 0 to 127 decimal).
-      final char = value.codeUnitAt(i);
-      if (char >= 128) {
-        return false;
-      }
-      _buf.setUint8(offset++, char);
-    }
-    _buf.setUint8(offset, 0); // trailing zero
-    _setUint32AtTail(_buf, _tail, value.length);
-    return true;
-  }
-
-  @pragma('vm:prefer-inline')
-  void _writeUTFString(String value) {
-    final bytes = utf8.encode(value) as Uint8List;
-    final length = bytes.length;
+    // Prepare the output buffer for a 32-bit "length" and ascii string bytes,
+    // extend if non-ascii. Write at the and and work our way to the beginning.
+    var tail = _tail;
+    var length = value.length;
     _prepare(4, 1, additionalBytes: length + 1);
-    _setUint32AtTail(_buf, _tail, length);
-    var offset = _buf.lengthInBytes - _tail + 4;
-    for (int i = 0; i < length; i++) {
-      _buf.setUint8(offset++, bytes[i]);
+
+    // adjust the local "tail" by the padding added by _prepare
+    tail += _tail - length - 4 - 1 - 1;
+
+    _setUint8AtTail(_buf, tail++, 0); // trailing zero
+
+    var i = length - 1; // start from the last index
+    for (; i >= 0; i--) {
+      final char = value.codeUnitAt(i);
+      // utf16 code unit, e.g. for '†' it's [0x20 0x20], which is 8224 decimal.
+      if (char >= 128) {
+        break; // -> i >= 0 ... treat [start..i] as utf16
+      }
+      _setUint8AtTail(_buf, tail++, char);
     }
-    _buf.setUint8(offset, 0); // trailing zero
+
+    if (i >= 0) {
+      // convert [start..i] from utf16 to utf8
+      final bytes = utf8.encoder.convert(value, 0, i + 1);
+      // the total length is: bytes.length + "written so far"
+      length = bytes.length + (length - i - 1);
+      // Prepare the additional buffer needed for the utf16 start of the string.
+      // Reset inner state to the current tail, _prepare needs it.
+      _tail = tail - 1;
+      _prepare(4, 1, additionalBytes: bytes.length, align: false);
+      for (i = bytes.length - 1; i >= 0; i--) {
+        _setUint8AtTail(_buf, tail++, bytes[i]);
+      }
+    }
+    _setUint32AtTail(_buf, _tail, length);
+    return _tail;
   }
 
   /// Throw an exception if there is not currently a vtable.
@@ -775,14 +774,15 @@ class Builder {
   /// Additionally allocate the specified `additionalBytes`. Update the current
   /// tail pointer to point at the allocated space.
   @pragma('vm:prefer-inline')
-  void _prepare(int size, int count, {int additionalBytes = 0}) {
+  void _prepare(int size, int count,
+      {int additionalBytes = 0, bool align = true}) {
     // Update the alignment.
     if (_maxAlign < size) {
       _maxAlign = size;
     }
     // Prepare amount of required space.
     int dataSize = size * count + additionalBytes;
-    int alignDelta = (-(_tail + dataSize)) & (size - 1);
+    int alignDelta = align ? (-(_tail + dataSize)) & (size - 1) : 0;
     int bufSize = alignDelta + dataSize;
     // Ensure that we have the required amount of space.
     {
